@@ -1,5 +1,10 @@
-from rag.rag import run
-from config import PDF_PATH, QUERY
+import uvicorn
+
+from config import API_HOST, API_PORT
 
 if __name__ == "__main__":
-    run(PDF_PATH, QUERY)
+    uvicorn.run(
+        "api.app:app",
+        host=API_HOST,
+        port=API_PORT,
+    )

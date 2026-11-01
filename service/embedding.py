@@ -1,8 +1,7 @@
 from sentence_transformers import SentenceTransformer
+from config import ST_MODEL_NAME
 
-MODEL_NAME = "BAAI/bge-m3"
-
-model = SentenceTransformer(MODEL_NAME)
+model = SentenceTransformer(ST_MODEL_NAME)
 
 
 def embed(texts):
