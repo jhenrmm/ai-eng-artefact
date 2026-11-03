@@ -30,22 +30,27 @@ If any requested information is missing or uncertain, say that you could not fin
 If the question is outside the store's scope, politely explain that you can only help with Empório da Música related matters."""
 
 
-def build_context(chunks, top_results, query):
+DEFAULT_TOP_K = 3
+ORDER_CHUNK_PREFIXES = ("[orders]", "[order_items]")
+
+
+def build_context(chunks, top_results, query, limit=None):
     include_orders = bool(ORDER_ID_PATTERN.search(query))
     selected = []
     for index in top_results.indices:
         chunk = chunks[index.item()]
-        if not include_orders and (
-            chunk.startswith("[orders]") or chunk.startswith("[order_items]")
-        ):
+        if not include_orders and chunk.startswith(ORDER_CHUNK_PREFIXES):
             continue
         selected.append(chunk)
+        if limit is not None and len(selected) >= limit:
+            break
     return "\n\n---\n\n".join(selected)
 
 
-def answer(query, chunks, vector_store, k=3, history=None):
-    top_results = retrieve(query, vector_store, k)
-    context = build_context(chunks, top_results, query)
+def answer(query, chunks, vector_store, k=DEFAULT_TOP_K, history=None):
+    candidate_k = min(len(chunks), max(k * 10, 20))
+    top_results = retrieve(query, vector_store, candidate_k)
+    context = build_context(chunks, top_results, query, limit=k)
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},

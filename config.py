@@ -14,6 +14,11 @@ OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "120"))
 
 CHAT_MAX_MESSAGE_CHARS = int(os.getenv("CHAT_MAX_MESSAGE_CHARS", "1000"))
 
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+)
+DATABASE_CONNECT_TIMEOUT = int(os.getenv("DATABASE_CONNECT_TIMEOUT", "5"))
+
 API_HOST = os.getenv("API_HOST")
 API_PORT = int(os.getenv("API_PORT"))
 

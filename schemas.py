@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from config import CHAT_MAX_MESSAGE_CHARS
@@ -11,4 +13,14 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     conversation_id: int
     message: str
+
+
+class ChatMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+
+class ConversationResponse(BaseModel):
+    conversation_id: int
+    messages: list[ChatMessage]
 

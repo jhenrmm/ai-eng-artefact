@@ -70,13 +70,6 @@ def format_product(row, categories):
     )
 
 
-def format_customer(row):
-    return (
-        f"[customers] Customer {row['customer_id']}: {row['name']}. "
-        f"Phone: {row['phone']}. Email: {row['email']}. City: {row['city']}."
-    )
-
-
 def format_order(row, customers):
     customer = customers.get(row["customer_id"], {})
     return (
@@ -127,7 +120,6 @@ def build_csv_chunks(csv_dir):
         format_order_item(row, orders, products)
         for row in tables.get("order_items", [])
     )
-    chunks.extend(format_customer(row) for row in customers.values())
     chunks.extend(
         format_promotion(row, products)
         for row in tables.get("promotions", [])
