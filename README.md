@@ -30,44 +30,43 @@ O cenário do desafio é uma equipe de atendimento sobrecarregada com perguntas 
 A solução é um agente que:
 
 - assume a persona da loja (tom informal, mas profissional, conforme o manual de políticas);
-- responde com base em duas fontes: o **manual de políticas** (PDF) e as **tabelas operacionais** (CSVs de produtos, pedidos, clientes e promoções);
-- classifica a intenção da pergunta e **roteia entre consultas estruturadas e RAG**: filtros exatos de catálogo (categoria, preço, estoque, promoção) e consultas de pedido vão para as tabelas operacionais; políticas e perguntas textuais vão para o índice vetorial;
-- evita inventar informação: o prompt exige que a resposta use apenas fatos presentes no contexto recuperado;
+- responde com base em duas fontes: o **manual de políticas** (PDF) e as **tabelas operacionais** (CSVs de produtos, pedidos, clientes, categorias e promoções);
+- usa **RAG com índice único e unificado**: os chunks do PDF e os registros dos CSVs (serializados em texto com prefixo de origem, ex.: `[products]`, `[orders]`, `[promotions]`) são embaralhados no mesmo índice vetorial, de modo que uma mesma busca semântica pode recuperar tanto regras de política quanto dados factuais;
+- evita inventar informação: o system prompt exige que a resposta use apenas fatos explícitos no contexto recuperado;
 - lida com perguntas fora do escopo informando que só pode ajudar com assuntos relacionados à loja;
 - mantém histórico de conversa persistido em PostgreSQL, permitindo retomar o atendimento pelo `conversation_id`.
 
 O agente **não executa ações** (cancelar pedido, emitir reembolso, alterar cadastro). Ele apenas informa e encaminha para a equipe humana quando necessário — decisão deliberada para reduzir risco no protótipo.
+
+---
 
 ## Arquitetura
 
 ```mermaid
 flowchart TD
     U[Cliente] -->|POST /chat| API[FastAPI]
-    API -->|busca histórico| DB[(PostgreSQL<br/>conversations + messages)]
-    API -->|pergunta| ROUTER[Router de intenção]
-    ROUTER -->|filtros exatos| STORE[(Tabelas operacionais<br/>produtos, pedidos, promoções)]
-    ROUTER -->|políticas e texto| RAG[Pipeline RAG]
-    RAG -->|embedding da pergunta| EMB[SentenceTransformers<br/>BAAI/bge-m3]
+    API -->|carrega histórico| DB[(PostgreSQL<br/>conversations + messages)]
+    API -->|embedding da pergunta| EMB[SentenceTransformers<br/>BAAI/bge-m3]
     EMB -->|similaridade de cosseno| IDX[Índice em memória<br/>chunks do PDF + registros dos CSVs]
-    STORE -->|resultado determinístico| LLM[Ollama<br/>qwen3:4b]
-    RAG -->|chunks de política| LLM
+    IDX -->|top-k chunks| LLM[Ollama<br/>qwen3:4b]
     LLM -->|resposta| API
     API -->|salva troca| DB
     API -->|JSON| U
 ```
 
+O índice é construído **uma única vez por processo**, de forma lazy, na primeira chamada a `/chat` (*double-checked locking* em `api/app.py`).
+
 Fluxo de uma requisição:
 
 1. `POST /chat` recebe `message` e, opcionalmente, `conversation_id`.
 2. Se houver `conversation_id`, o histórico é carregado do PostgreSQL (404 se não existir).
-3. `service/router.py` classifica a intenção e extrai filtros determinísticos. Consultas de catálogo (categoria, faixa de preço, estoque, promoção, nome/modelo) e consultas de pedido por ID vão para `service/store.py`, que consulta as tabelas operacionais em memória. Políticas e perguntas sem filtros estruturados seguem para o pipeline RAG.
-4. O resultado estruturado (lista completa de produtos ou pedido específico) entra no contexto como fonte autoritativa. Para evitar duplicação e truncamento, os chunks de produto/promoção/pedido correspondentes são removidos do contexto RAG; políticas continuam vindo da busca semântica.
-5. Em perguntas de acompanhamento ("ele está em promoção?", "e o rastreamento?"), o router resolve a referência usando o histórico da conversa.
-6. O contexto selecionado é injetado no prompt, junto com o system prompt e o histórico.
-7. A resposta é gerada pelo Ollama, devolvida ao cliente e a troca (mensagem do usuário + resposta) é persistida.
-8. Em uma conversa nova, o `conversation_id` é criado no momento da persistência e devolvido na resposta.
+3. Na primeira chamada, o índice é construído: extração de texto do PDF com PyMuPDF, leitura dos CSVs, serialização dos registros em chunks com origem, geração de embeddings com `BAAI/bge-m3` e criação do índice em memória.
+4. A pergunta do cliente é embutida e submetida a busca por similaridade de cosseno sobre o índice (top-k, padrão `k=3`).
+5. O contexto selecionado é montado com os `top-k` chunks recuperados, injetado no system prompt junto com o histórico da conversa, e enviado ao Ollama.
+6. A resposta é gerada pelo Ollama, devolvida ao cliente e a troca (mensagem do usuário + resposta) é persistida no PostgreSQL.
+7. Em uma conversa nova, o `conversation_id` é criado no momento da persistência e devolvido na resposta.
 
-O índice é construído **uma única vez por processo**, de forma lazy, na primeira chamada a `/chat`, com *double-checked locking* (`api/app.py`).
+---
 
 ## Stack utilizada
 
@@ -75,43 +74,43 @@ O índice é construído **uma única vez por processo**, de forma lazy, na prim
 |---|---|
 | Linguagem | Python 3.11 |
 | API | FastAPI + Uvicorn |
-| LLM | `qwen3:4b` via [Ollama](https://ollama.com/) local |
-| Embeddings | `BAAI/bge-m3` via `sentence-transformers` |
-| Vetor store | Índice em memória + similaridade de cosseno (`sentence_transformers.util.cos_sim`) |
+| LLM | `qwen3:4b` via [Ollama](https://ollama.com/) local (cliente HTTP puro com `urllib`, sem SDK) |
+| Embeddings | `BAAI/bge-m3` via `sentence-transformers` (vetores normalizados) |
+| Vetor store | Índice em memória + similaridade de cosseno (`sentence_transformers.util.cos_sim`), top-k fixo |
 | Parsing do PDF | PyMuPDF (`pymupdf`) |
 | Dados tabulares | `csv` da biblioteca padrão |
-| Consulta estruturada | Tabelas em memória + filtros determinísticos (categoria, preço, estoque, status, promoção, pedido) |
 | Banco de dados | PostgreSQL + `psycopg` |
 | Migrations | Alembic |
 | Validação | Pydantic (via FastAPI) |
 | Containerização | Docker + Docker Compose |
 
-Não há LangChain, LlamaIndex ou SDK de provedor de LLM: o pipeline é implementado diretamente, com poucas dependências e fluxo explícito.
+Não há LangChain, LlamaIndex nem SDK de provedor de LLM: o pipeline RAG é implementado diretamente, com poucas dependências e fluxo explícito.
+
+---
 
 ## Decisões técnicas e justificativas
 
-### 1. Abordagem: RAG híbrido em um único índice
+### 1. Abordagem: RAG com índice único e unificado
 
-Optei por **RAG com busca semântica sobre um índice único**, combinando:
+Optei por **RAG com busca semântica sobre um único índice**, combinando:
 
-- os chunks de texto do manual de políticas;
-- os registros dos CSVs convertidos em descrições em linguagem natural, prefixadas pela origem (`[products]`, `[orders]`, `[promotions]`, etc.).
+- os chunks de texto do manual de políticas (extraído com PyMuPDF, chunks fixos de 500 caracteres);
+- os registros dos CSVs convertidos em descrições em linguagem natural, prefixados pela origem (`[products]`, `[orders]`, `[order_items]`, `[promotions]`, `[categories]`).
 
-Chamei de "híbrido" porque o índice contém dados **não estruturados** (políticas) e **estruturados** (catálogo, pedidos), permitindo que a mesma pergunta recupere tanto regras quanto dados factuais.
+Chamei de "único e unificado" porque o índice contém dados **não estruturados** (políticas) e **estruturados serializados** (catálogo, pedidos, promoções), permitindo que a mesma pergunta recupere tanto regras quanto dados factuais com uma única chamada de busca.
 
-Por que não um agente de SQL ou function calling?
+Por que não um agente de SQL, function calling ou ReAct?
 
-- O volume é pequeno (65 produtos, 20 pedidos, 25 promoções, 50 clientes). Não há ganho relevante de performance em consultas SQL dinâmicas.
+- O volume é pequeno (dezenas de produtos, pedidos, clientes e promoções). Não há ganho relevante de performance em consultas SQL dinâmicas.
 - Um agente de SQL adiciona modos de falha (SQL inválido, alucinação de colunas, necessidade de retry e validação) sem melhorar a experiência neste escopo.
 - A serialização dos registros em texto preserva o vocabulário do domínio ("violão clássico", "tampo sólido", "nylon"), o que funciona bem com embeddings multilíngues.
-- Na primeira versão, o cálculo de preço com desconto, os filtros por faixa de preço e a disponibilidade eram resolvidos pelo LLM a partir dos registros recuperados. Isso funciona para consultas pontuais, mas não garante listagens completas nem agregações — foi o trade-off aceito naquele momento.
 
-Esse limite motivou a implementação da [decisão 8](#8-roteamento-entre-consultas-estruturadas-e-rag): filtros exatos, listagens e consultas de pedido agora vão para as tabelas operacionais, enquanto o RAG permanece para políticas e perguntas abertas.
+O trade-off é conhecido: como a recuperação é puramente semântica com top-k fixo (`k=3`), listagens exaustivas (ex.: "todos os violões até R$ 1.000") podem ficar incompletas se os produtos relevantes não estiverem entre os `k` mais similares. A evolução natural é adicionar roteamento com filtros determinísticos para consultas de catálogo e pedido.
 
 ### 2. Modelo e provedor
 
 - **LLM: `qwen3:4b` via Ollama local.** Escolhi um modelo local por custo zero, privacidade dos dados fictícios de clientes e facilidade de reprodução (basta ter Ollama). O modelo tem bom desempenho em português e segue instruções de restrição de contexto. O tamanho (4B) mantém a latência aceitável em máquina de desenvolvimento e o timeout configurável em 120s cobre as respostas mais longas.
-- **Embeddings: `BAAI/bge-m3`.** Modelo multilíngue com boa qualidade em português, vetores normalizados (norma 1), o que torna a similaridade de cosseno adequada. O modelo é carregado uma única vez, de forma lazy, na primeira chamada a `embed()` (`service/embedding.py`), evitando carregar ~2,3 GB de pesos apenas ao importar o módulo.
+- **Embeddings: `BAAI/bge-m3`.** Modelo multilíngue com boa qualidade em português, vetores normalizados (norma 1), o que torna a similaridade de cosseno adequada.
 
 A chamada ao Ollama é feita via HTTP puro (`urllib`), sem SDK, o que mantém a superfície de dependências pequena. Erros de conexão, timeout, HTTP e JSON inválido são convertidos em `OllamaError` e devolvidos como `503` pela API.
 
@@ -134,7 +133,7 @@ A persistência só ocorre após uma resposta bem-sucedida do LLM: se o Ollama f
 
 O system prompt (`service/rag.py`) é deliberadamente restritivo:
 
-- **Fonte única de verdade:** responder apenas com fatos explícitos no contexto; proibido inferir, deduzir ou combinar informações.
+- **Fonte única de verdade:** responder apenas com fatos explícitos no contexto; proibido inferir, deduzir, assumir, combinar, completar ou especular sobre qualquer informação.
 - **Antialucinação em pedidos:** nunca afirmar que um pedido foi cancelado, entregue, reembolsado, trocado, reservado ou cobrado sem que o contexto diga isso.
 - **Sem falsa capacidade de ação:** o agente não tem acesso a sistemas, então não pode dizer "vou verificar", "vou consultar o sistema" ou prometer executar algo. Isso evita a pior experiência possível: o cliente acreditar que uma ação foi tomada.
 - **Trocas e devoluções:** para perguntas de devolução, o agente explica apenas a política e oferece encaminhamento ao time de suporte. Ele não pede ID de pedido nesse fluxo, para não criar expectativa de análise individual.
@@ -142,73 +141,59 @@ O system prompt (`service/rag.py`) é deliberadamente restritivo:
 - **Fora de escopo:** informa educadamente que só pode ajudar com assuntos relacionados à Empório da Música.
 - **Idioma e persona:** sempre em português brasileiro, tom cordial e conciso, alinhado ao manual ("informal mas profissional").
 
-O contexto RAG é montado com até 3 chunks (`k=3`) após os filtros de pedido. Quando há resultado estruturado, o bloco autoritativo é adicionado ao contexto e os chunks correspondentes são suprimidos para evitar duplicação. O prompt inclui o histórico da conversa antes da pergunta atual.
+O contexto RAG é montado com até 3 chunks (`k=3`). O prompt inclui o histórico da conversa antes da pergunta atual.
 
 ### 6. Tratamento dos dados
 
-- CSVs lidos com `utf-8-sig` (o arquivo original tem BOM).
+- CSVs lidos com `utf-8-sig` (os arquivos têm BOM).
 - O nome da tabela é derivado do nome do arquivo após `" - "` (`desafio_tecnico_ai_eng - products.csv` → `products`).
 - Chaves estrangeiras são resolvidas na ingestão: produto → nome da categoria; pedido → nome do cliente; item de pedido → nome do produto e status do pedido; promoção → nome do produto.
-- Preços são formatados com duas casas decimais no padrão do código (`R$ 2199.00`); `specs` é um JSON por produto, convertido em pares `chave=valor`.
+- Preços são formatados com duas casas decimais no padrão brasileiro (`R$ 2199.00`); `specs` é um JSON por produto, convertido em pares `chave=valor`.
 - O PDF é extraído com PyMuPDF e dividido em chunks fixos de 500 caracteres (`CHUNK_SIZE`), descartando trechos vazios.
 - A atividade da promoção é derivada do campo `is_active` (`1`/`0`).
-- Dados de clientes não são indexados como chunks próprios; aparecem apenas como nome associado ao pedido (os campos de telefone/e-mail não são usados).
+- Dados de clientes não são indexados como chunks próprios; aparecem apenas como nome associado ao pedido (telefone/e-mail não são usados).
 
-A ingestão e o carregamento das tabelas operacionais são executados no start da primeira conversa, não em background. O agente reflete o snapshot dos CSVs no momento em que o índice e o store são construídos; alterações nos arquivos exigem reinício do processo.
+A ingestão e o carregamento das tabelas operacionais são executados na primeira requisição a `/chat`, não em background. O agente reflete o snapshot dos CSVs/PDF no momento em que o índice é construído; alterações nos arquivos exigem reinício do processo.
 
 ### 7. Containerização
 
 O `docker-compose.yml` sobe a API, o PostgreSQL e o Ollama em uma rede interna, com três volumes nomeados (`pgdata`, `ollama`, `hf_cache`) para persistir banco e modelos entre reinícios. As decisões principais:
 
-- **Migrations no entrypoint, com retry.** `docker/entrypoint.sh` executa `alembic upgrade head` antes do Uvicorn. O `depends_on` com healthcheck do PostgreSQL já cobre a maior parte da corrida, mas o retry torna o start resiliente a reinícios do banco.
+- **Migrations no entrypoint, com retry.** `docker/entrypoint.sh` executa `alembic upgrade head` antes do Uvicorn, com retentativas enquanto o banco estiver indisponível.
 - **`ollama-pull` como serviço one-shot.** A API só sobe depois que o modelo de chat foi baixado (`condition: service_completed_successfully`). Isso evita a primeira requisição falhar por modelo ausente.
 - **PyTorch CPU.** O `Dockerfile` instala `torch` do índice CPU antes das demais dependências. Sem isso, o PyPI baixaria as wheels CUDA e a imagem cresceria vários GB sem ganho em um host sem GPU.
-- **Cache de modelos em volume.** `HF_HOME` aponta para `/cache`, montado no volume `hf_cache`; o `bge-m3` não é baixado de novo a cada `docker compose up`.
+- **Cache de modelos em volume.** `HF_HOME` e `SENTENCE_TRANSFORMERS_HOME` apontam para `/cache`, montado no volume `hf_cache`; o `bge-m3` não é baixado de novo a cada `docker compose up`.
 - **Superfície mínima exposta.** Apenas a API publica porta no host (`8001`). PostgreSQL e Ollama ficam acessíveis somente na rede do Compose.
 - **Healthchecks.** PostgreSQL (`pg_isready`), Ollama (`ollama list`) e API (`/health`) têm verificações próprias; o `start_period` da API é longo para acomodar o carregamento do modelo de embeddings.
 
 O usuário do container é não-root (`appuser`, UID 10001), e as dependências são instaladas em uma camada separada do código para aproveitar o cache de build.
 
-### 8. Roteamento entre consultas estruturadas e RAG
-
-Implementei o item de maior impacto da lista de evoluções: em vez de depender apenas do top-k semântico para tudo, o agente agora **classifica a intenção e encaminha filtros exatos para consultas estruturadas**, mantendo o RAG para políticas e perguntas abertas.
-
-O fluxo ficou dividido em três módulos:
-
-- `service/router.py` — classifica a intenção e extrai filtros determinísticos: categoria, faixa de preço (incluindo formatos como `R$ 1.000,00` e `mil reais`), estoque, status, promoção/desconto, ordenação, nome/modelo do produto e ID de pedido. Também resolve referências de acompanhamento ("ele", "e o rastreamento?") a partir do histórico.
-- `service/store.py` — carrega os CSVs em memória e executa as consultas. Produtos são filtrados por categoria, preço efetivo (considerando promoção ativa), estoque, status, desconto e termos de nome/descrição. Pedidos são resolvidos por ID com cliente e itens, retornando apenas o pedido correspondente.
-- `service/structured.py` — transforma o resultado em um bloco de contexto autoritativo (`[structured_products]` ou `[structured_order]`), informa se a lista está completa ou truncada e omite IDs internos.
-
-Quando há resultado estruturado, os chunks correspondentes do RAG são suprimidos para evitar duplicação e truncamento. As políticas continuam vindo do índice vetorial. O prompt foi ajustado para tratar o bloco estruturado como fonte preferencial, listar todos os itens quando a lista está completa e nunca completar lacunas com produtos de fora do resultado.
-
-O trade-off é conhecido: o parser é baseado em regras e cobre as formulações mais comuns do domínio; paráfrases muito distantes podem cair no RAG. A vantagem é que filtros exatos, listagens e consultas de pedido ficam reproduzíveis e testáveis, sem uma chamada extra ao LLM. A evolução natural é substituir as regras por function calling mantendo a mesma camada de consulta.
+---
 
 ## Estrutura do repositório
 
 ```text
 .
 ├── api/
-│   └── app.py               # endpoints /health, /chat e /conversations/{id}
+│   └── app.py               # endpoints /health, /chat e /conversations/{id};
+│                              índice lazy com double-checked locking
 ├── service/
-│   ├── database.py          # conexão, histórico e persistência (PostgreSQL)
-│   ├── embedding.py         # carregamento do BAAI/bge-m3 e geração de embeddings
-│   ├── ingestion.py         # PDF + CSVs -> chunks (com origem)
-│   ├── ollama.py            # cliente HTTP do Ollama
-│   ├── rag.py               # system prompt, montagem de contexto e resposta
-│   ├── retriever.py         # embedding da query + busca por similaridade
-│   ├── router.py            # intenção + filtros estruturados
-│   ├── store.py             # consultas a produtos, pedidos e promoções
-│   ├── structured.py        # contexto autoritativo das consultas
-│   ├── tables.py            # leitura dos CSVs
-│   └── vector_store.py      # índice em memória e top-k
+│   ├── __init__.py
+│   ├── database.py          # conexão PostgreSQL, histórico e persistência de trocas
+│   ├── embedding.py         # SentenceTransformer BAAI/bge-m3 e geração de embeddings
+│   ├── ingestion.py         # PDF (PyMuPDF) + CSVs -> chunks com origem
+│   ├── ollama.py            # cliente HTTP puro do Ollama (urllib)
+│   ├── rag.py               # system prompt, montagem de contexto (top-k) e chamada ao LLM
+│   ├── retriever.py         # embedding da query + busca por similaridade (top-k)
+│   └── vector_store.py      # índice em memória + cos_sim top-k
 ├── migrations/
 │   ├── env.py
 │   └── versions/
 │       └── 0001_create_chat_tables.py
 ├── docker/
-│   └── entrypoint.sh        # aplica migrations e inicia a API
-├── Dockerfile
-├── docker-compose.yml       # API + PostgreSQL + Ollama
+│   └── entrypoint.sh        # aplica migrations com retry e inicia a API
+├── Dockerfile               # Python 3.11-slim, PyTorch CPU, usuário não-root (appuser)
+├── docker-compose.yml       # postgres + ollama + ollama-pull + api (rede interna)
 ├── data/
 │   ├── desafio_tecnico_ai_eng - categories.csv
 │   ├── desafio_tecnico_ai_eng - customers.csv
@@ -217,15 +202,19 @@ O trade-off é conhecido: o parser é baseado em regras e cobre as formulações
 │   ├── desafio_tecnico_ai_eng - products.csv
 │   ├── desafio_tecnico_ai_eng - promotions.csv
 │   └── políticas_da_loja.pdf
-├── exemplos/                # transcrições reais de interação
-├── tests/                   # testes do router e das consultas estruturadas
+├── exemplos/                # 5 transcrições reais de interação + README
+├── desafio_tecnico_ai_eng_artefact.pdf
+├── .env.example
+├── .gitignore
+├── .dockerignore
+├── alembic.ini
 ├── config.py                # leitura de variáveis de ambiente
 ├── main.py                  # entrypoint (Uvicorn)
-├── schemas.py               # contratos Pydantic
-├── alembic.ini
-├── requirements.txt
-└── .env.example
+├── README.md
+└── requirements.txt
 ```
+
+---
 
 ## Como rodar o projeto
 
@@ -260,7 +249,7 @@ Na primeira execução, o processo pode levar vários minutos:
 
 1. build da imagem (instala PyTorch CPU, FastAPI, PyMuPDF etc.);
 2. download da imagem do Ollama e do modelo `qwen3:4b` (~2,5 GB) pelo `ollama-pull`;
-3. download do modelo de embeddings `BAAI/bge-m3` (~2,3 GB) na primeira subida da API.
+3. download do modelo de embeddings `BAAI/bge-m3` (~2,3 GB) na primeira subida da API / primeira chamada a `/chat`.
 
 Acompanhe com:
 
@@ -362,7 +351,6 @@ Copy-Item .env.example .env
 | `DATA_DIR` | não | `data` | Diretório dos CSVs |
 | `CHUNK_SIZE` | não | `500` | Tamanho dos chunks do PDF, em caracteres |
 | `CHAT_MAX_MESSAGE_CHARS` | não | `1000` | Tamanho máximo de uma mensagem do usuário |
-| `STRUCTURED_MAX_RESULTS` | não | `25` | Máximo de itens retornados por consulta estruturada de produtos |
 
 Exemplo de `.env`:
 
@@ -375,7 +363,6 @@ OLLAMA_MODEL=qwen3:4b
 OLLAMA_TIMEOUT=120
 
 CHAT_MAX_MESSAGE_CHARS=1000
-STRUCTURED_MAX_RESULTS=25
 
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/artefact
 DATABASE_CONNECT_TIMEOUT=5
@@ -400,15 +387,9 @@ python main.py
 
 A API ficará em `http://127.0.0.1:8001`, com documentação interativa em <http://127.0.0.1:8001/docs>.
 
-> **Primeira execução:** o `BAAI/bge-m3` é baixado (~2,3 GB) na primeira chamada que precisa gerar embeddings. O índice é construído na primeira chamada a `/chat` (extração do PDF + leitura dos CSVs + geração de embeddings). Isso pode levar alguns minutos. As chamadas seguintes reutilizam o índice em memória.
+> **Primeira execução:** o `BAAI/bge-m3` é baixado (~2,3 GB) e o índice é construído na primeira chamada a `/chat` (extração do PDF + leitura dos CSVs + geração de embeddings). Isso pode levar alguns minutos. As chamadas seguintes reutilizam o índice em memória.
 
-### Testes automatizados
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-Os testes cobrem o roteador de intenção e as consultas estruturadas (filtros de preço, estoque, promoção, pedido e resolução de acompanhamento) e não exigem Ollama nem PostgreSQL.
+---
 
 ## Usando a API
 
@@ -469,28 +450,32 @@ curl http://127.0.0.1:8001/conversations/1
 | `404` | `conversation_id` inexistente |
 | `503` | Ollama indisponível/timeout ou banco inacessível |
 
+---
+
 ## Exemplos de interação
 
 As conversas de exemplo estão em [`exemplos/`](exemplos/). São transcrições reais, geradas executando a API local com o `qwen3:4b`, sem edição das mensagens:
 
 | # | Cenário | O que demonstra |
 |---|---|---|
-| [01](exemplos/01-consulta-catalogo.md) | "Quais opções de violões disponíveis custando até R$ 1000?" | consulta ao catálogo e filtro por preço (transcrição anterior ao roteamento estruturado) |
+| [01](exemplos/01-consulta-catalogo.md) | "Quais opções de violões disponíveis custando até R$ 1000?" | consulta ao catálogo e filtro de preço via recuperação semântica |
 | [02](exemplos/02-preco-estoque-promocao.md) | "Quanto custa o Takamine GD20 e ele está disponível em estoque?" | preço, estoque, promoção e uso do histórico |
 | [03](exemplos/03-status-pedido.md) | "Qual o status e o código de rastreamento do pedido 1?" | consulta de pedido e relato sem promessa de ação |
 | [04](exemplos/04-politica-devolucao.md) | "Me arrependi da minha compra, posso devolver meu pedido?" | aplicação da política de arrependimento |
 | [05](exemplos/05-fora-de-escopo.md) | "Qual é a previsão do tempo em Campo Grande amanhã?" | recusa educada de assunto fora do escopo |
 
-Cada arquivo inclui a transcrição e uma análise curta do comportamento, com pontos de atenção quando aplicável. A transcrição do exemplo 01 foi gravada antes do roteamento estruturado: naquela versão, a lista de produtos abaixo de R$ 1.000 ficava incompleta porque o top-k fixo não cobria todos os registros que atendiam ao filtro. Com a implementação atual, a mesma pergunta é resolvida por consulta estruturada e retorna os 12 violões ativos nessa faixa (ver [decisão 8](#8-roteamento-entre-consultas-estruturadas-e-rag)).
+Cada arquivo inclui a transcrição e uma análise curta do comportamento, com pontos de atenção quando aplicável.
+
+> Nota: como a recuperação é puramente semântica com top-k fixo (3 chunks), respostas que exigem listagem exaustiva de catálogo podem ficar incompletas (ver [Limitações conhecidas](#limitações-conhecidas)).
+
+---
 
 ## Limitações conhecidas
 
-- **Sem autenticação e sem vínculo cliente↔conversa.** Qualquer pessoa que informe um ID de pedido pode receber dados daquele pedido (status, rastreamento, itens etc.). Isso é intencional no protótipo: o desafio exige explicitamente que o agente saiba consultar dados operacionais, incluindo **status de pedido**, a partir dos CSVs fornecidos. O agente só reporta dados de um pedido quando o cliente informa um ID que corresponde a um registro existente nos dados da loja, e nunca inventa status, rastreamento, prazos ou itens. O filtro por regex reduz a exposição em perguntas genéricas, mas não é controle de acesso; em produção seria necessário vincular a conversa ao cliente e autorizar a consulta (ver item 1 do "O que eu faria com mais tempo").
-- **Roteador baseado em regras.** O parser cobre as formulações mais comuns do domínio (categoria, faixa de preço, estoque, promoção, status, pedido e ordenação), mas paráfrases distantes ou filtros compostos incomuns podem não ser reconhecidos e cair no RAG. Nesses casos, a resposta continua sujeita ao top-k e pode ficar incompleta.
-- **Top-k fixo em 3 chunks para políticas.** Listagens de catálogo e consultas de pedido não dependem mais do top-k, mas perguntas textuais sobre políticas ainda são limitadas a 3 chunks e podem perder trechos relevantes do manual.
-- **IDs internos podem vazar quando o RAG é usado.** O bloco estruturado omite IDs e o prompt proíbe repeti-los, mas os chunks de produto/pedido do RAG ainda carregam identificadores internos. Se o roteador não reconhecer a consulta, o modelo pode repeti-los.
-- **Índice vetorial e store em memória, por processo.** Ambos são reconstruídos a cada reinício, não são compartilhados entre workers e não há persistência de embeddings. Com `--workers > 1`, cada worker mantém sua própria cópia.
+- **Recuperação puramente semântica, sem roteamento estruturado.** Não há filtros determinísticos nem consulta direta a tabelas: tudo depende da busca semântica com top-k fixo (`k=3`). Listagens exaustivas de catálogo (ex.: "todos os violões até R$ 1.000") podem ficar incompletas se os produtos relevantes não estiverem entre os `k` mais similares.
+- **Top-k fixo em 3 chunks para políticas.** Perguntas textuais sobre políticas ainda são limitadas a 3 chunks e podem perder trechos relevantes do manual.
 - **Chunking fixo de 500 caracteres, sem overlap.** Pode cortar tabelas, listas e seções do manual no meio, prejudicando a recuperação de políticas específicas.
+- **Índice vetorial e embeddings em memória, por processo.** Ambos são reconstruídos a cada reinício, não são compartilhados entre workers e não há persistência de embeddings. Com `--workers > 1`, cada worker mantém sua própria cópia.
 - **Snapshot dos dados.** Alterações nos CSVs/PDF só valem após reiniciar o processo.
 - **Histórico sem limite.** Todo o histórico é enviado ao LLM; conversas longas podem estourar a janela de contexto ou aumentar a latência.
 - **Sem streaming.** A resposta só é devolvida após a geração completa; o timeout é de 120s.
@@ -498,31 +483,38 @@ Cada arquivo inclui a transcrição e uma análise curta do comportamento, com p
 - **Promoções sem validação temporal.** O agente considera apenas o campo `is_active` do CSV; não há verificação de vigência por data.
 - **Status de pedido é estático.** Os dados vêm do CSV, não de um sistema logístico em tempo real.
 - **Sem ações transacionais.** O agente não cancela pedidos, não emite reembolsos e não altera cadastros — apenas informa e encaminha.
-- **Testes limitados.** Há testes unitários determinísticos para o roteador e as consultas estruturadas, mas não há testes de integração da API, avaliação de groundedness, CI nem observabilidade (rate limiting, logs estruturados, métricas, redação de PII).
-- **Imagem Docker em CPU.** O `Dockerfile` instala PyTorch CPU para evitar as wheels CUDA; a inferência é mais lenta do que com GPU.
+- **Sem autenticação e sem vínculo cliente↔conversa.** Qualquer pessoa que informe um ID de pedido pode receber dados daquele pedido. Em produção seria necessário vincular a conversa ao cliente e autorizar a consulta.
 - **Mensagens limitadas a 1000 caracteres.**
 - **Dependência de serviços locais.** Ollama e PostgreSQL precisam estar acessíveis; não há fallback para outro provedor.
+- **O modelo de embeddings (~2,3 GB) é carregado na primeira requisição**, quando a ingestão do índice é disparada.
+
+---
 
 ## O que eu faria com mais tempo
 
-O roteamento entre consultas estruturadas e RAG ([decisão 8](#8-roteamento-entre-consultas-estruturadas-e-rag)) era o item de maior impacto e já está implementado. Os próximos passos seriam:
+Os próximos passos seriam:
 
-1. **Autenticação e escopo por cliente.** Vincular a conversa a um cliente e permitir consulta apenas aos próprios pedidos, com auditoria.
-2. **Índice vetorial persistente com `pgvector`.** Eliminar a reconstrução a cada start e permitir atualização incremental.
-3. **Chunking semântico com overlap e citação de fontes.** Dividir por seções do manual, preservar tabelas e retornar a origem da informação ao cliente.
-4. **Function calling no roteador.** Substituir as regras por tool calling do LLM, mantendo a camada de consulta estruturada e ampliando a cobertura de paráfrases.
-5. **Reranking e query rewriting.** Melhorar a precisão do top-k, especialmente para perguntas ambíguas e filtros numéricos.
-6. **Avaliação e testes.** Golden set de perguntas/respostas, testes de fumaça da API, testes de retrieval e avaliação de groundedness (LLM-as-judge), integrados a CI.
-7. **Guardrails.** Classificador de escopo, detecção de prompt injection, redação de PII e limite de histórico por sumarização.
-8. **Streaming e handoff humano.** Respostas via SSE, integração com WhatsApp e transferência para atendente com resumo da conversa.
-9. **Observabilidade.** Logs estruturados, métricas de latência/tokens, tracing do pipeline e alertas de erro.
-10. **CI/CD e deploy.** GitHub Actions para lint, testes, build da imagem e publicação em um registry.
+1. **Roteamento entre consultas estruturadas e RAG.** Adicionar classificação de intenção e filtros determinísticos (categoria, preço, estoque, pedido) para consultas de catálogo e pedido, mantendo o RAG para políticas — item de maior impacto e ainda não implementado.
+2. **Autenticação e escopo por cliente.** Vincular a conversa a um cliente e permitir consulta apenas aos próprios pedidos, com auditoria.
+3. **Índice vetorial persistente com `pgvector`.** Eliminar a reconstrução a cada start e permitir atualização incremental.
+4. **Chunking semântico com overlap e citação de fontes.** Dividir por seções do manual, preservar tabelas e retornar a origem da informação ao cliente.
+5. **Function calling no roteador.** Substituir regras por tool calling do LLM, mantendo a camada de consulta estruturada e ampliando a cobertura de paráfrases.
+6. **Reranking e query rewriting.** Melhorar a precisão do top-k, especialmente para perguntas ambíguas e filtros numéricos.
+7. **Avaliação e testes.** Golden set de perguntas/respostas, testes de fumaça da API, testes de retrieval e avaliação de groundedness (LLM-as-judge), integrados a CI.
+8. **Guardrails.** Classificador de escopo, detecção de prompt injection, redação de PII e limite de histórico por sumarização.
+9. **Streaming e handoff humano.** Respostas via SSE, integração com WhatsApp e transferência para atendente com resumo da conversa.
+10. **Observabilidade.** Logs estruturados, métricas de latência/tokens, tracing do pipeline e alertas de erro.
+11. **CI/CD e deploy.** GitHub Actions para lint, testes, build da imagem e publicação em um registry.
+
+---
 
 ## Uso de assistentes de código
 
 Usei o **OpenCode** como assistente de código ao longo do desenvolvimento. Meu workflow foi dividir o projeto em etapas e usar o agente para implementar uma parte por vez. Antes de avançar para a etapa seguinte, eu revisava o código gerado e testava a funcionalidade daquela parte, confirmando que estava funcionando antes de prosseguir. Isso manteve as mudanças pequenas e verificáveis, e me permitiu corrigir rumo cedo quando alguma decisão não funcionava como esperado.
 
-As decisões de arquitetura, as escolhas de tecnologia e a validação final do comportamento do agente foram minhas. A redação inicial deste README também contou com o auxílio do OpenCode a partir do PDF do desafio.
+As decisões de arquitetura, as escolhas de tecnologia e a validação final do comportamento do agente foram minhas. A redação deste README também contou com o auxílio do OpenCode a partir do PDF do desafio.
+
+---
 
 ## Suposições assumidas
 
