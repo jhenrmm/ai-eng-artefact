@@ -1,0 +1,10 @@
+.git
+.gitignore
+.env
+venv
+__pycache__
+*.pyc
+.pytest_cache
+desafio_tecnico_ai_eng_artefact.pdf
+README.md
+exemplos
